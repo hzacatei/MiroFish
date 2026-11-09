@@ -19,7 +19,10 @@ from openai import OpenAI
 from ..config import Config
 from ..utils.logger import get_logger
 from ..utils.locale import get_language_instruction, get_locale, set_locale, t
-from ..utils.openai_chat_compat import create_chat_completion, extract_chat_completion_text
+from ..utils.openai_chat_compat import (
+    create_chat_completion_with_json_fallback,
+    extract_chat_completion_text,
+)
 from ..utils.zep import (
     call_zep_read_with_retry,
     get_zep_client,
@@ -570,7 +573,7 @@ class OasisProfileGenerator:
         
         for attempt in range(max_attempts):
             try:
-                response = create_chat_completion(
+                response = create_chat_completion_with_json_fallback(
                     self.client,
                     model=self.model_name,
                     messages=[

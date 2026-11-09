@@ -21,7 +21,10 @@ from openai import OpenAI
 from ..config import Config
 from ..utils.logger import get_logger
 from ..utils.locale import get_language_instruction, t
-from ..utils.openai_chat_compat import create_chat_completion, extract_chat_completion_text
+from ..utils.openai_chat_compat import (
+    create_chat_completion_with_json_fallback,
+    extract_chat_completion_text,
+)
 from .zep_entity_reader import EntityNode, ZepEntityReader
 
 logger = get_logger('mirofish.simulation_config')
@@ -441,7 +444,7 @@ class SimulationConfigGenerator:
         
         for attempt in range(max_attempts):
             try:
-                response = create_chat_completion(
+                response = create_chat_completion_with_json_fallback(
                     self.client,
                     model=self.model_name,
                     messages=[

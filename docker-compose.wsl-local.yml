@@ -1,0 +1,20 @@
+# Local linux/amd64 image for WSL2 rootless Podman.
+# Does not pull ghcr.io/666ghj/mirofish. Publish ports on loopback only.
+# Stop the container already bound to 3000 and 5001 before starting this one.
+# Build with scripts/build-local-podman.sh. This file never pushes an image.
+services:
+  mirofish:
+    image: localhost/mirofish:local
+    pull_policy: never
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: mirofish-local
+    env_file:
+      - .env
+    ports:
+      - "127.0.0.1:3000:3000"
+      - "127.0.0.1:5001:5001"
+    restart: "no"
+    volumes:
+      - ./backend/uploads:/app/backend/uploads

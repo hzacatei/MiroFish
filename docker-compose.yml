@@ -1,5 +1,8 @@
 services:
   mirofish:
+    # ghcr.io/666ghj/mirofish:latest is still official v0.1.2 (985f89f).
+    # A local amd64 build that includes the JSON-mode fallback is
+    # docker-compose.wsl-local.yml. Do not replace this line with a publish.
     image: ghcr.io/666ghj/mirofish:latest
     # 加速镜像（如拉取缓慢可替换上方地址）
     # image: ghcr.nju.edu.cn/666ghj/mirofish:latest

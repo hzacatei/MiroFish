@@ -20,7 +20,11 @@ class CompletionSequence:
 
 class ProviderError(RuntimeError):
     def __init__(self, *, status_code, body):
-        super().__init__(body.get("error", {}).get("message", "provider error"))
+        if isinstance(body, dict):
+            message = body.get("error", {}).get("message", "provider error")
+        else:
+            message = str(body)
+        super().__init__(message)
         self.status_code = status_code
         self.body = body
 
@@ -147,6 +151,108 @@ def test_chat_json_error_does_not_echo_partial_model_output():
 
     assert "SENTINEL-SHOULD-NOT-LEAK" not in str(captured.value)
     assert captured.value.finish_reason == "length"
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "response_format.type must be json_schema",
+        "`response_format.type` must be `json_schema`",
+        'response_format.type must be "json_schema"',
+        "'response_format.type' must be 'json_schema' or 'text'",
+        "response_format.type: Input should be 'json_schema'",
+    ],
+)
+def test_chat_json_drops_json_object_when_provider_requires_json_schema(message):
+    """Anthropic OpenAI compatibility returns this 400 without param or code."""
+
+    rejected = ProviderError(
+        status_code=400,
+        body={
+            "type": "error",
+            "error": {
+                "type": "invalid_request_error",
+                "message": message,
+            },
+            "request_id": "req_mock_anthropic",
+        },
+    )
+    sequence = CompletionSequence(rejected, _response('{"entity_types": []}'))
+    client = _client_for(sequence)
+
+    result = client.chat_json(
+        messages=[{"role": "user", "content": "Return JSON"}],
+        max_attempts=1,
+    )
+
+    assert result == {"entity_types": []}
+    assert sequence.calls[0]["response_format"] == {"type": "json_object"}
+    assert "response_format" not in sequence.calls[1]
+
+
+def test_chat_json_schema_rejection_does_not_consume_the_content_retry():
+    rejected = ProviderError(
+        status_code=400,
+        body={
+            "type": "error",
+            "error": {
+                "type": "invalid_request_error",
+                "message": "response_format.type must be json_schema",
+            },
+        },
+    )
+    sequence = CompletionSequence(
+        rejected,
+        _response('{"items": [', finish_reason="length"),
+        _response('{"items": [1]}'),
+    )
+    client = _client_for(sequence)
+
+    assert client.chat_json(
+        messages=[{"role": "user", "content": "Return JSON"}],
+        max_attempts=2,
+    ) == {"items": [1]}
+    assert sequence.calls[0]["response_format"] == {"type": "json_object"}
+    assert "response_format" not in sequence.calls[1]
+    assert "response_format" not in sequence.calls[2]
+
+
+def test_chat_json_accepts_raw_json_schema_rejection_body():
+    rejected = ProviderError(
+        status_code=400,
+        body='{"error":{"message":"response_format.type must be json_schema"}}',
+    )
+    sequence = CompletionSequence(rejected, _response('{"ok": true}'))
+    client = _client_for(sequence)
+
+    assert client.chat_json(
+        messages=[{"role": "user", "content": "Return JSON"}],
+        max_attempts=1,
+    ) == {"ok": True}
+    assert "response_format" not in sequence.calls[1]
+
+
+def test_chat_json_does_not_treat_schema_validation_as_json_object_rejection():
+    schema_error = ProviderError(
+        status_code=400,
+        body={
+            "error": {
+                "type": "invalid_request_error",
+                "message": "response_format.json_schema.schema is invalid",
+            }
+        },
+    )
+    sequence = CompletionSequence(schema_error, _response('{"ok": true}'))
+    client = _client_for(sequence)
+
+    with pytest.raises(ProviderError) as captured:
+        client.chat_json(
+            messages=[{"role": "user", "content": "Return JSON"}],
+            max_attempts=2,
+        )
+
+    assert captured.value is schema_error
+    assert len(sequence.calls) == 1
 
 
 def test_chat_json_falls_back_only_for_explicit_response_format_rejection():
