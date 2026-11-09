@@ -1,0 +1,12 @@
+# Source-only layer on an image already built locally.
+# Does not reinstall Node, uv, or the Python dependencies.
+# The parent tag must already exist in the local Podman store.
+#
+#   podman build --platform linux/amd64 \
+#     -f Dockerfile.local-overlay \
+#     --build-arg BASE_IMAGE=localhost/mirofish:4438450ae19f1de735796cbe46fa97572945dbf7 \
+#     -t localhost/mirofish:local \
+#     backend/app/utils
+ARG BASE_IMAGE=localhost/mirofish:local
+FROM ${BASE_IMAGE}
+COPY openai_chat_compat.py /app/backend/app/utils/openai_chat_compat.py

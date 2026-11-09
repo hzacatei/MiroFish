@@ -8,6 +8,7 @@ from app.utils.openai_chat_compat import (
     extract_chat_completion_text,
     is_gpt5_family,
     is_response_format_unsupported,
+    is_temperature_deprecated,
 )
 
 
@@ -171,6 +172,150 @@ def test_json_fallback_does_not_loop_when_the_retry_also_fails():
 
     assert len(recorder.calls) == 2
     assert "response_format" not in recorder.calls[1]
+
+
+def _temperature_deprecated_error():
+    return ProviderError(
+        status_code=400,
+        body={
+            "type": "error",
+            "error": {
+                "type": "invalid_request_error",
+                "message": "`temperature` is deprecated for this model.",
+                "param": None,
+            },
+        },
+    )
+
+
+def test_deprecated_temperature_retries_once_without_the_parameter():
+    recorder = CompletionRecorder()
+    recorder.error = _temperature_deprecated_error()
+    original_create = recorder.create
+
+    def create(**kwargs):
+        if len(recorder.calls) == 0:
+            return original_create(**kwargs)
+        recorder.error = None
+        return original_create(**kwargs)
+
+    recorder.create = create
+    messages = [{"role": "user", "content": "hello"}]
+
+    create_chat_completion(
+        client_for(recorder),
+        model="claude-haiku-5-5",
+        messages=messages,
+        temperature=0.3,
+        max_tokens=128,
+        response_format={"type": "json_object"},
+    )
+
+    assert recorder.calls[0]["temperature"] == 0.3
+    assert "temperature" not in recorder.calls[1]
+    assert recorder.calls[1]["max_tokens"] == 128
+    assert recorder.calls[1]["response_format"] == {"type": "json_object"}
+    assert len(recorder.calls) == 2
+
+
+def test_temperature_retry_propagates_the_second_failure():
+    first = _temperature_deprecated_error()
+    second = _temperature_deprecated_error()
+    recorder = CompletionRecorder()
+    failures = [first, second]
+    original_create = recorder.create
+
+    def create(**kwargs):
+        recorder.error = failures.pop(0)
+        return original_create(**kwargs)
+
+    recorder.create = create
+
+    with pytest.raises(ProviderError) as captured:
+        create_chat_completion(
+            client_for(recorder),
+            model="claude-haiku-5-5",
+            messages=[],
+            temperature=0.3,
+        )
+
+    assert captured.value is second
+    assert len(recorder.calls) == 2
+    assert recorder.calls[0]["temperature"] == 0.3
+    assert "temperature" not in recorder.calls[1]
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        ProviderError(
+            status_code=400,
+            body={
+                "error": {
+                    "type": "invalid_request_error",
+                    "message": "temperature must be less than or equal to 1",
+                    "param": "temperature",
+                }
+            },
+        ),
+        ProviderError(
+            status_code=400,
+            body={
+                "error": {
+                    "type": "invalid_request_error",
+                    "message": "`top_p` is deprecated for this model.",
+                    "param": None,
+                }
+            },
+        ),
+        ProviderError(
+            status_code=400,
+            body={
+                "error": {
+                    "type": "invalid_request_error",
+                    "message": "response_format.type must be json_schema",
+                    "param": None,
+                }
+            },
+        ),
+        ProviderError(
+            status_code=500,
+            body={
+                "error": {
+                    "type": "api_error",
+                    "message": "`temperature` is deprecated for this model.",
+                }
+            },
+        ),
+        ProviderError(
+            status_code=400,
+            body={"error": {"message": "request failed for an unrelated reason"}},
+        ),
+    ],
+)
+def test_nonmatching_temperature_failures_are_not_retried(error):
+    recorder = CompletionRecorder(error=error)
+
+    with pytest.raises(ProviderError) as captured:
+        create_chat_completion(
+            client_for(recorder),
+            model="claude-haiku-5-5",
+            messages=[{"role": "user", "content": "hello"}],
+            temperature=0.3,
+        )
+
+    assert captured.value is error
+    assert len(recorder.calls) == 1
+    assert recorder.calls[0]["temperature"] == 0.3
+    assert is_temperature_deprecated(error) is False
+
+
+def test_raw_temperature_deprecation_body_is_recognized():
+    error = ProviderError(
+        status_code=422,
+        body='{"error":{"message":"`temperature` is deprecated for this model."}}',
+    )
+    assert is_temperature_deprecated(error) is True
 
 
 def test_schema_validation_error_is_not_a_json_object_rejection():
