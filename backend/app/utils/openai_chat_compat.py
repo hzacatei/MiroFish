@@ -7,7 +7,21 @@ gracefully adapting request parameters for GPT-5 family models.
 
 from __future__ import annotations
 
+import logging
+import re
 from typing import Any, Dict, List, Optional
+
+logger = logging.getLogger(__name__)
+
+# Anthropic's OpenAI compatibility layer rejects {"type": "json_object"} with
+# HTTP 400 "response_format.type must be json_schema" and does not set the
+# param/code fields the generic unsupported-parameter check looks for.
+# Some local servers use the same sentence, or a Pydantic-style
+# "Input should be 'json_schema'".
+_JSON_SCHEMA_TYPE_REJECTION = re.compile(
+    r"response_format\b.*(?:must be|input should be).*json_schema\b",
+    re.IGNORECASE | re.DOTALL,
+)
 
 
 def is_gpt5_family(model: Optional[str]) -> bool:
@@ -55,6 +69,99 @@ def create_chat_completion(
             kwargs["max_tokens"] = max_tokens
 
     return client.chat.completions.create(**kwargs)
+
+
+def _message_rejects_json_object(message: str) -> bool:
+    """True when the provider refuses json_object and requires json_schema."""
+
+    normalized = message.replace("`", " ").replace("'", " ").replace('"', " ")
+    return _JSON_SCHEMA_TYPE_REJECTION.search(normalized) is not None
+
+
+def is_response_format_unsupported(error: Exception) -> bool:
+    """Detect an explicit provider rejection of JSON response_format."""
+
+    if getattr(error, "status_code", None) not in {400, 422}:
+        return False
+
+    body = getattr(error, "body", None)
+    if isinstance(body, str):
+        return _message_rejects_json_object(body)
+    if not isinstance(body, dict):
+        return False
+
+    details = body.get("error", body)
+    if isinstance(details, str):
+        return _message_rejects_json_object(details)
+    if not isinstance(details, dict):
+        return False
+
+    param = str(details.get("param") or "").strip().lower()
+    if param == "response_format" or param.startswith("response_format."):
+        return True
+
+    message = str(details.get("message") or "")
+    if _message_rejects_json_object(message):
+        return True
+
+    lowered = message.lower()
+    if "response_format" not in lowered:
+        return False
+
+    code = str(details.get("code") or "").lower()
+    unsupported_codes = {
+        "unsupported_parameter",
+        "unsupported_value",
+        "unknown_parameter",
+        "invalid_parameter",
+    }
+    unsupported_phrases = (
+        "not support",
+        "unsupported",
+        "unknown parameter",
+        "unrecognized parameter",
+    )
+    return code in unsupported_codes or any(
+        phrase in lowered for phrase in unsupported_phrases
+    )
+
+
+def create_chat_completion_with_json_fallback(
+    client: Any,
+    *,
+    model: str,
+    messages: List[Dict[str, Any]],
+    temperature: Optional[float] = None,
+    max_tokens: Optional[int] = None,
+    response_format: Optional[Dict[str, Any]] = None,
+) -> Any:
+    """Send one completion, then one more without response_format if it is rejected.
+
+    LLMClient.chat_json keeps this negotiation itself so a later content retry
+    does not send json_object again. Profile and simulation-config generation
+    call the OpenAI SDK directly and use this helper for the same one-shot drop.
+    """
+
+    active_format = response_format
+    while True:
+        try:
+            return create_chat_completion(
+                client,
+                model=model,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                response_format=active_format,
+            )
+        except Exception as error:
+            if active_format is not None and is_response_format_unsupported(error):
+                logger.warning(
+                    "LLM provider explicitly rejected response_format; "
+                    "retrying once without JSON mode"
+                )
+                active_format = None
+                continue
+            raise
 
 
 def extract_chat_completion_text(response: Any) -> str:

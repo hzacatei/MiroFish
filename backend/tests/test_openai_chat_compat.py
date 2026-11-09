@@ -4,9 +4,18 @@ import pytest
 
 from app.utils.openai_chat_compat import (
     create_chat_completion,
+    create_chat_completion_with_json_fallback,
     extract_chat_completion_text,
     is_gpt5_family,
+    is_response_format_unsupported,
 )
+
+
+class ProviderError(RuntimeError):
+    def __init__(self, *, status_code, body):
+        super().__init__("provider error")
+        self.status_code = status_code
+        self.body = body
 
 
 class CompletionRecorder:
@@ -102,6 +111,78 @@ def test_provider_error_is_propagated_without_guessing_or_retrying():
 )
 def test_gpt5_family_detection(model, expected):
     assert is_gpt5_family(model) is expected
+
+
+def test_json_fallback_retries_once_without_response_format():
+    anthropic_error = ProviderError(
+        status_code=400,
+        body={
+            "type": "error",
+            "error": {
+                "type": "invalid_request_error",
+                "message": "response_format.type must be json_schema",
+            },
+        },
+    )
+    recorder = CompletionRecorder()
+    recorder.error = anthropic_error
+    original_create = recorder.create
+
+    def create(**kwargs):
+        if len(recorder.calls) == 0:
+            return original_create(**kwargs)
+        recorder.error = None
+        return original_create(**kwargs)
+
+    recorder.create = create
+    messages = [{"role": "user", "content": "hello"}]
+
+    create_chat_completion_with_json_fallback(
+        client_for(recorder),
+        model="claude-sonnet",
+        messages=messages,
+        temperature=0.3,
+        response_format={"type": "json_object"},
+    )
+
+    assert recorder.calls[0]["response_format"] == {"type": "json_object"}
+    assert "response_format" not in recorder.calls[1]
+    assert len(recorder.calls) == 2
+
+
+def test_json_fallback_does_not_loop_when_the_retry_also_fails():
+    anthropic_error = ProviderError(
+        status_code=400,
+        body={
+            "error": {
+                "message": "response_format.type must be json_schema",
+            }
+        },
+    )
+    recorder = CompletionRecorder(error=anthropic_error)
+
+    with pytest.raises(ProviderError):
+        create_chat_completion_with_json_fallback(
+            client_for(recorder),
+            model="claude-sonnet",
+            messages=[],
+            response_format={"type": "json_object"},
+        )
+
+    assert len(recorder.calls) == 2
+    assert "response_format" not in recorder.calls[1]
+
+
+def test_schema_validation_error_is_not_a_json_object_rejection():
+    error = ProviderError(
+        status_code=400,
+        body={
+            "error": {
+                "message": "response_format.json_schema.schema is invalid",
+            }
+        },
+    )
+    assert is_response_format_unsupported(error) is False
 
 
 def test_extracts_text_from_supported_content_shapes():
