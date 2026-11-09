@@ -22,6 +22,15 @@ _JSON_SCHEMA_TYPE_REJECTION = re.compile(
     r"response_format\b.*(?:must be|input should be).*json_schema\b",
     re.IGNORECASE | re.DOTALL,
 )
+# claude-haiku-5-5 rejects a sent temperature with HTTP 400
+# "`temperature` is deprecated for this model." and param unset.
+# Omitting the parameter is accepted. A range error such as
+# "temperature must be <= 1" is a different failure and must surface.
+_TEMPERATURE_DEPRECATED = re.compile(
+    r"\btemperature\b.{0,80}\b(?:deprecated|unsupported|not supported)\b"
+    r"|\b(?:deprecated|unsupported|not supported)\b.{0,80}\btemperature\b",
+    re.IGNORECASE | re.DOTALL,
+)
 
 
 def is_gpt5_family(model: Optional[str]) -> bool:
@@ -46,8 +55,12 @@ def create_chat_completion(
     Compatibility strategy:
     - For GPT-5 family, avoid sending temperature by default.
     - For token limit, use `max_completion_tokens` on GPT-5, `max_tokens` otherwise.
-    - Preserve the legacy request shape for every non-GPT-5 model/provider.
-    - Propagate provider errors unchanged instead of guessing from message text.
+    - Preserve the legacy request shape, including temperature, for every
+      other model until that provider explicitly rejects the parameter.
+    - A single HTTP 400/422 that says temperature is deprecated or
+      unsupported drops only that parameter and retries once.
+    - Range errors and every other provider error propagate unchanged.
+      The retry's own failure is also propagated, not replaced.
     """
     kwargs: Dict[str, Any] = {
         "model": model,
@@ -68,7 +81,51 @@ def create_chat_completion(
         else:
             kwargs["max_tokens"] = max_tokens
 
-    return client.chat.completions.create(**kwargs)
+    try:
+        return client.chat.completions.create(**kwargs)
+    except Exception as error:
+        if "temperature" not in kwargs or not is_temperature_deprecated(error):
+            raise
+        logger.warning(
+            "LLM provider explicitly rejected temperature; "
+            "retrying once without the temperature parameter"
+        )
+        kwargs.pop("temperature", None)
+        return client.chat.completions.create(**kwargs)
+
+
+def _provider_error_text(error: Exception) -> Optional[str]:
+    """Return the provider message only for an explicit 400 or 422 body."""
+
+    if getattr(error, "status_code", None) not in {400, 422}:
+        return None
+
+    body = getattr(error, "body", None)
+    if isinstance(body, str):
+        return body
+    if not isinstance(body, dict):
+        return None
+
+    details = body.get("error", body)
+    if isinstance(details, str):
+        return details
+    if not isinstance(details, dict):
+        return None
+
+    message = details.get("message")
+    if not isinstance(message, str):
+        return None
+    return message
+
+
+def is_temperature_deprecated(error: Exception) -> bool:
+    """True when the provider rejects the temperature parameter itself."""
+
+    message = _provider_error_text(error)
+    if not message:
+        return False
+    normalized = message.replace("`", " ").replace("'", " ").replace('"', " ")
+    return _TEMPERATURE_DEPRECATED.search(normalized) is not None
 
 
 def _message_rejects_json_object(message: str) -> bool:

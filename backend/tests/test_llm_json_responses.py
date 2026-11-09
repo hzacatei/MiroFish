@@ -255,6 +255,77 @@ def test_chat_json_does_not_treat_schema_validation_as_json_object_rejection():
     assert len(sequence.calls) == 1
 
 
+def test_chat_json_drops_temperature_only_after_response_format_fallback():
+    """Ontology sends both parameters. Anthropic rejects them on separate calls."""
+
+    format_rejected = ProviderError(
+        status_code=400,
+        body={
+            "type": "error",
+            "error": {
+                "type": "invalid_request_error",
+                "message": "response_format.type must be json_schema",
+                "param": None,
+            },
+        },
+    )
+    temperature_rejected = ProviderError(
+        status_code=400,
+        body={
+            "type": "error",
+            "error": {
+                "type": "invalid_request_error",
+                "message": "`temperature` is deprecated for this model.",
+                "param": None,
+            },
+        },
+    )
+    sequence = CompletionSequence(
+        format_rejected,
+        temperature_rejected,
+        _response('{"ok": true}'),
+    )
+    client = _client_for(sequence)
+
+    assert client.chat_json(
+        messages=[{"role": "user", "content": "Return JSON"}],
+        temperature=0.3,
+        max_attempts=1,
+    ) == {"ok": True}
+    assert sequence.calls[0]["response_format"] == {"type": "json_object"}
+    assert sequence.calls[0]["temperature"] == 0.3
+    assert "response_format" not in sequence.calls[1]
+    assert sequence.calls[1]["temperature"] == 0.3
+    assert "response_format" not in sequence.calls[2]
+    assert "temperature" not in sequence.calls[2]
+    assert len(sequence.calls) == 3
+
+
+def test_chat_json_does_not_hide_a_temperature_range_error():
+    range_error = ProviderError(
+        status_code=400,
+        body={
+            "error": {
+                "type": "invalid_request_error",
+                "message": "temperature must be less than or equal to 1",
+                "param": "temperature",
+            }
+        },
+    )
+    sequence = CompletionSequence(range_error, _response('{"ok": true}'))
+    client = _client_for(sequence)
+
+    with pytest.raises(ProviderError) as captured:
+        client.chat_json(
+            messages=[{"role": "user", "content": "Return JSON"}],
+            temperature=0.3,
+            max_attempts=2,
+        )
+
+    assert captured.value is range_error
+    assert len(sequence.calls) == 1
+
+
 def test_chat_json_falls_back_only_for_explicit_response_format_rejection():
     unsupported = ProviderError(
         status_code=400,
